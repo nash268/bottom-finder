@@ -1,0 +1,371 @@
+// ══════════════════════════════════════════════════════════════════════
+// Long-Term Bottom Finder — General Equities Edition v1.2
+// EXIT UPGRADE: scored tiered exits (max 4), new extension + rollover signals
+// ══════════════════════════════════════════════════════════════════════
+//@version=6
+indicator("Long-Term Bottom Finder — Equities", overlay=true, max_bars_back=500)
+
+// ─── INPUTS ───────────────────────────────────────────────────────────
+grpRSI = "RSI Settings"
+rsiLen  = input.int(14, "RSI Length",               group=grpRSI)
+rsiOS   = input.int(30, "RSI Oversold Threshold",   group=grpRSI,
+          tooltip="Weekly RSI below this = oversold.")
+rsiOBin = input.int(70, "RSI Overbought Threshold", group=grpRSI,
+          tooltip="Weekly RSI above this = overbought.")
+
+grpPR = "Price Ratio  (Price / 200-Day SMA Proxy)"
+prLowThresh  = input.float(0.75, "Price Ratio Low  (buy zone)",  step=0.05, group=grpPR,
+               tooltip="Below 0.75 = deeply below 200-day MA — strong buy zone.")
+prHighThresh = input.float(1.50, "Price Ratio High (exit zone)", step=0.05, group=grpPR,
+               tooltip="Above 1.50 = significantly extended above 200-day MA.")
+
+grpDC = "Death / Golden Cross"
+dcMaFast = input.int(10, "Fast MA (weeks) — ~50-Day SMA",  group=grpDC,
+           tooltip="50-day SMA / 5 = 10 weeks.")
+dcMaSlow = input.int(40, "Slow MA (weeks) — ~200-Day SMA", group=grpDC,
+           tooltip="200-day SMA / 5 = 40 weeks.")
+
+grp200W = "200-Week MA Zone"
+nearPct     = input.float(5.0,  "Near 200W MA Entry Threshold (%)",     step=0.5,  group=grp200W,
+              tooltip="Price within this % above 200W MA = support zone.")
+extendedPct = input.float(40.0, "Extended Above 200W MA Exit Threshold (%)", step=5.0, group=grp200W,
+              tooltip="Price this % above 200W MA = historically overextended. Adds +1 to exit score.")
+
+grpDisp = "Display"
+show200w     = input.bool(true, "Show 200-Week MA",            group=grpDisp)
+showCrossMAs = input.bool(true, "Show Death/Golden Cross MAs",  group=grpDisp)
+show200d     = input.bool(true, "Show 200-Day MA Proxy",        group=grpDisp)
+showExtLine  = input.bool(true, "Show 200W Extension Level",    group=grpDisp)
+showLabels   = input.bool(true, "Show Signal Label on Chart",   group=grpDisp)
+showTable    = input.bool(true, "Show Dashboard Table",         group=grpDisp)
+
+// ─── MOVING AVERAGES ──────────────────────────────────────────────────
+sma_fast = ta.sma(close, dcMaFast)
+sma_slow = ta.sma(close, dcMaSlow)
+sma200w  = ta.sma(close, 200)
+
+// Extension level plotted as a dotted line so traders can see the target
+extLevel = not na(sma200w) ? sma200w * (1.0 + extendedPct / 100.0) : na
+
+// ─── CORE ENTRY SIGNALS ───────────────────────────────────────────────
+
+// 1. Weekly RSI Oversold
+rsi       = ta.rsi(close, rsiLen)
+sig_rsiOS = rsi < rsiOS
+
+// 2. Death Cross Zone
+sig_dc   = sma_fast < sma_slow
+dc_cross = ta.crossunder(sma_fast, sma_slow)
+gc_cross = ta.crossover (sma_fast, sma_slow)
+
+// 3a. Near 200-Week MA
+sig_near200w  = close < (sma200w * (1.0 + nearPct / 100.0))
+// 3b. Below 200-Week MA — bonus
+sig_below200w = close < sma200w
+
+// 4. Price Ratio
+priceRatio = not na(sma_slow) ? close / sma_slow : na
+sig_prLow  = not na(priceRatio) and priceRatio < prLowThresh
+
+// ─── ENTRY SCORE (max 5) ──────────────────────────────────────────────
+sigScore = (
+    (sig_rsiOS     ? 1 : 0) +
+    (sig_dc        ? 1 : 0) +
+    (sig_near200w  ? 1 : 0) +
+    (sig_prLow     ? 1 : 0) +
+    (sig_below200w ? 1 : 0)
+)
+
+prevScore = na(sigScore[1]) ? 0 : sigScore[1]
+
+// ─── EXIT SIGNALS (scored, max 4) ────────────────────────────────────
+//
+//  +1  Golden Cross:           fast MA crossed back above slow MA
+//      (confirms trend reversal — bottom fully played out)
+//  +1  RSI Overbought:         RSI currently above threshold
+//      (momentum overheated)
+//  +1  RSI Rollover:           RSI was overbought, has now fallen back below
+//      (momentum exhaustion — often the last exit warning)
+//  +1  Price Ratio High:       price / 200-day SMA proxy above threshold
+//      (price stretched above medium-term average)
+//  +1  200W MA Extended:       price above 200W MA by extendedPct%
+//      (price stretched above long-term average — historically rare territory)
+//
+//  NOTE: RSI Overbought and RSI Rollover are mutually exclusive by design,
+//        so max realistic score remains 4.
+
+exit_gc        = gc_cross                                                    // event: crossover bar only
+exit_rsiOB     = rsi > rsiOBin                                               // state: currently overbought
+exit_rsiRoll   = rsi < rsiOBin and rsi[1] >= rsiOBin                        // event: just rolled below OB
+exit_prHigh    = not na(priceRatio) and priceRatio > prHighThresh            // state: price ratio extended
+exit_200wExt   = not na(sma200w)    and close > extLevel                    // state: far above 200W MA
+
+// RSI Overbought and Rollover are mutually exclusive — one or the other per bar
+exit_rsiAny    = exit_rsiOB or exit_rsiRoll
+
+// ─── EXIT SCORE (max 4) ───────────────────────────────────────────────
+exitScore = (
+    (exit_gc      ? 1 : 0) +
+    (exit_rsiAny  ? 1 : 0) +
+    (exit_prHigh  ? 1 : 0) +
+    (exit_200wExt ? 1 : 0)
+)
+
+prevExitScore = na(exitScore[1]) ? 0 : exitScore[1]
+
+// Tiered exit thresholds
+// REDUCE:    exitScore reaches 2 for first time — trim position
+// FULL EXIT: exitScore reaches 3+ for first time — close or heavily reduce
+reduceSignal   = exitScore == 2 and prevExitScore < 2
+fullExitSignal = exitScore >= 3 and prevExitScore < 3
+
+// Legacy combined boolean for alerts
+exitSignal = reduceSignal or fullExitSignal
+
+// ─── BACKGROUND ZONE COLOR (entry zones only) ────────────────────────
+zoneColor = sigScore >= 5 ? color.new(color.purple,  45)
+          : sigScore == 4 ? color.new(color.fuchsia,  55)
+          : sigScore == 3 ? color.new(color.teal,     60)
+          : sigScore == 2 ? color.new(color.blue,     70)
+          : sigScore == 1 ? color.new(color.gray,     82)
+          : na
+
+bgcolor(zoneColor, title="Accumulation Zone")
+
+// ─── MA PLOTS ─────────────────────────────────────────────────────────
+plot(show200w     ? sma200w   : na, "200-Week MA",
+     color=color.new(color.orange, 0), linewidth=2)
+plot(show200d     ? sma_slow  : na, "200-Day SMA Proxy (Slow MA)",
+     color=color.new(color.blue, 20), linewidth=1)
+plot(showCrossMAs ? sma_fast  : na, "50-Day SMA Proxy (Fast MA)",
+     color=color.new(color.lime, 10), linewidth=1)
+plot(showExtLine  ? extLevel  : na, "200W Extension Exit Level",
+     color=color.new(color.red, 40), linewidth=1, style=plot.style_circles)
+
+// ─── ENTRY SHAPES ─────────────────────────────────────────────────────
+maxEntry   = sigScore >= 4 and prevScore < 4
+heavyEntry = sigScore == 3 and prevScore < 3
+
+plotshape(maxEntry,
+          title="Max Entry", text="MAX BUY",
+          style=shape.triangleup, location=location.belowbar,
+          color=color.purple, textcolor=color.white, size=size.large)
+
+plotshape(heavyEntry,
+          title="Heavy Entry", text="HEAVY",
+          style=shape.triangleup, location=location.belowbar,
+          color=color.teal, textcolor=color.white, size=size.normal)
+
+plotshape(dc_cross and not maxEntry and not heavyEntry,
+          title="Death Cross Event", text="DC",
+          style=shape.circle, location=location.belowbar,
+          color=color.red, textcolor=color.white, size=size.small)
+
+// ─── EXIT SHAPES (tiered) ─────────────────────────────────────────────
+// REDUCE — orange, small: 2 exit signals active
+// plotshape(reduceSignal,
+//           title="Reduce Position", text="REDUCE",
+//           style=shape.triangledown, location=location.abovebar,
+//           color=color.orange, textcolor=color.white, size=size.normal)
+
+// // FULL EXIT — red, large: 3+ exit signals active
+// plotshape(fullExitSignal,
+//           title="Full Exit", text="FULL EXIT",
+//           style=shape.triangledown, location=location.abovebar,
+//           color=color.red, textcolor=color.white, size=size.large)
+
+// RSI Rollover standalone marker (even if exit score < 2) — subtle warning
+plotshape(exit_rsiRoll and not reduceSignal and not fullExitSignal,
+          title="RSI Rollover", text="RSI↓",
+          style=shape.circle, location=location.abovebar,
+          color=color.new(color.orange, 30), textcolor=color.white, size=size.small)
+
+// ─── DASHBOARD TABLE ──────────────────────────────────────────────────
+var table dash = table.new(
+     position.top_right, 2, 14,
+     border_width=1, border_color=color.new(color.gray, 40),
+     frame_color=color.new(color.gray, 40), frame_width=1)
+
+if showTable and barstate.islast
+    c_hdr  = color.rgb(25, 25, 50)
+    c_ehdr = color.rgb(50, 20, 20)
+    c_row  = color.rgb(15, 15, 35)
+    c_ok   = color.lime
+    c_no   = color.new(color.red, 20)
+    c_warn = color.new(color.orange, 0)
+    c_wht  = color.white
+
+    scoreColor = sigScore >= 4 ? color.purple
+               : sigScore == 3 ? color.teal
+               : sigScore >= 1 ? color.blue
+               : color.gray
+
+    exitScoreColor = exitScore >= 3 ? color.red
+                   : exitScore == 2 ? color.orange
+                   : exitScore == 1 ? color.new(color.yellow, 20)
+                   : color.gray
+
+    // Pre-build all dynamic strings
+    rsiLabel  = "RSI (" + str.tostring(rsiLen) + "W)"
+    rsiVal    = (sig_rsiOS ? "✓ " : "✗ ") + str.tostring(math.round(rsi, 1))
+    dcGap     = not na(sma_fast) ? math.round((sma_slow / sma_fast - 1.0) * 100.0, 1) : 0.0
+    dcVal     = sig_dc ? "✓ ACTIVE" : "✗ Gap: " + str.tostring(dcGap) + "%"
+    pct200w   = not na(sma200w) ? math.round((close / sma200w - 1.0) * 100.0, 1) : 0.0
+    nearLabel = "Near 200W MA (<" + str.tostring(nearPct) + "%)"
+    nearVal   = (sig_near200w ? "✓ " : "✗ ") + str.tostring(pct200w) + "%"
+    prVal     = not na(priceRatio) ? str.tostring(math.round(priceRatio, 3)) : "n/a"
+    prLowVal  = (sig_prLow ? "✓ " : "✗ ") + prVal
+
+    // Exit signal strings
+    gcVal      = exit_gc     ? "✓ CROSSED"   : "✗ " + str.tostring(math.round((sma_fast / sma_slow - 1.0) * 100.0, 1)) + "% gap"
+    rsiOBVal   = exit_rsiOB  ? "✓ OB: "      + str.tostring(math.round(rsi, 1))
+               : exit_rsiRoll? "✓ ROLLOVER " + str.tostring(math.round(rsi, 1))
+               : "✗ " + str.tostring(math.round(rsi, 1))
+    prHiLabel  = "P.Ratio Hi (>" + str.tostring(prHighThresh) + ")"
+    prHiVal    = exit_prHigh ? "✓ " + prVal : "✗ " + prVal
+    extLabel   = "200W Extended (>" + str.tostring(extendedPct) + "%)"
+    extVal     = exit_200wExt ? "✓ " + str.tostring(pct200w) + "%" : "✗ " + str.tostring(pct200w) + "%"
+
+    exitAction = exitScore >= 3 ? ">>> FULL EXIT <<<"
+               : exitScore == 2 ? ">> REDUCE <<"
+               : exitScore == 1 ? "> WATCH >"
+               : "No Exit Signal"
+
+    // ── ENTRY SECTION ──
+    table.cell(dash, 0, 0, "Bottom Finder — Equities",
+               text_color=c_wht, bgcolor=c_hdr,
+               text_size=size.small, text_halign=text.align_center)
+    table.cell(dash, 1, 0, "ENTRY: " + str.tostring(sigScore) + " / 5",
+               text_color=c_wht, bgcolor=scoreColor,
+               text_size=size.small, text_halign=text.align_center)
+
+    table.cell(dash, 0, 1, rsiLabel,
+               text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 1, rsiVal,
+               text_color=sig_rsiOS ? c_ok : c_no, bgcolor=c_row, text_size=size.small)
+
+    table.cell(dash, 0, 2, "Death Cross Zone",
+               text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 2, dcVal,
+               text_color=sig_dc ? c_ok : c_no, bgcolor=c_row, text_size=size.small)
+
+    table.cell(dash, 0, 3, nearLabel,
+               text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 3, nearVal,
+               text_color=sig_near200w ? c_ok : c_no, bgcolor=c_row, text_size=size.small)
+
+    table.cell(dash, 0, 4, "Below 200W MA (+1 bonus)",
+               text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 4, sig_below200w ? "✓ YES" : "✗ NO",
+               text_color=sig_below200w ? c_ok : c_no, bgcolor=c_row, text_size=size.small)
+
+    table.cell(dash, 0, 5, "Price Ratio (P / 200D SMA)",
+               text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 5, prLowVal,
+               text_color=sig_prLow ? c_ok : c_no, bgcolor=c_row, text_size=size.small)
+
+    // ── EXIT SECTION ──
+    table.cell(dash, 0, 6, "── EXIT SCORE ──",
+               text_color=color.new(color.red, 0), bgcolor=c_ehdr,
+               text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 1, 6, str.tostring(exitScore) + " / 4  " + exitAction,
+               text_color=c_wht, bgcolor=exitScoreColor,
+               text_size=size.tiny, text_halign=text.align_center)
+
+    table.cell(dash, 0, 7, "Golden Cross",
+               text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 7, gcVal,
+               text_color=exit_gc ? c_warn : c_no, bgcolor=c_row, text_size=size.small)
+
+    table.cell(dash, 0, 8, "RSI OB / Rollover",
+               text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 8, rsiOBVal,
+               text_color=exit_rsiAny ? c_warn : c_no, bgcolor=c_row, text_size=size.small)
+
+    table.cell(dash, 0, 9, prHiLabel,
+               text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 9, prHiVal,
+               text_color=exit_prHigh ? c_warn : c_no, bgcolor=c_row, text_size=size.small)
+
+    table.cell(dash, 0, 10, extLabel,
+               text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 10, extVal,
+               text_color=exit_200wExt ? color.red : c_no, bgcolor=c_row, text_size=size.small)
+
+    // ── ALERT STATUS ──
+    table.cell(dash, 0, 11, "── STATUS ──",
+               text_color=c_wht, bgcolor=c_hdr,
+               text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 1, 11, "",
+               bgcolor=c_hdr, text_color=c_wht, text_size=size.tiny)
+
+    table.cell(dash, 0, 12, "Entry Action",
+               text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 12,
+               sigScore >= 4 ? "MAX BUY"   :
+               sigScore == 3 ? "HEAVY BUY" :
+               sigScore == 2 ? "WATCH"     : "NO SIGNAL",
+               text_color=sigScore >= 3 ? c_ok : sigScore == 2 ? c_warn : c_no,
+               bgcolor=c_row, text_size=size.small)
+
+    table.cell(dash, 0, 13, "Exit Action",
+               text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 13, exitAction,
+               text_color=exitScore >= 3 ? color.red : exitScore >= 2 ? c_warn : c_no,
+               bgcolor=c_row, text_size=size.small)
+
+// ─── ON-CHART LABEL ───────────────────────────────────────────────────
+if showLabels and barstate.islast and (sigScore >= 2 or exitScore >= 2)
+    prStr    = not na(priceRatio) ? str.tostring(math.round(priceRatio, 2)) : "n/a"
+    labelTxt = "ENTRY " + str.tostring(sigScore) + "/5  |  EXIT " + str.tostring(exitScore) + "/4\n"
+             + (sig_rsiOS     ? "✓" : "✗") + " RSI: "          + str.tostring(math.round(rsi, 1)) + "\n"
+             + (sig_dc        ? "✓" : "✗") + " Death Cross Zone\n"
+             + (sig_near200w  ? "✓" : "✗") + " Near 200W MA\n"
+             + (sig_below200w ? "✓" : "✗") + " Below 200W MA\n"
+             + (sig_prLow     ? "✓" : "✗") + " Price Ratio: "  + prStr
+
+    labelColor = exitScore >= 3 ? color.red
+               : exitScore == 2 ? color.orange
+               : sigScore >= 4  ? color.purple
+               : sigScore == 3  ? color.teal
+               : color.blue
+
+    label.new(bar_index, 0, labelTxt,
+              yloc=yloc.belowbar,
+              style=label.style_label_up,
+              color=color.new(labelColor, 15),
+              textcolor=color.white,
+              size=size.normal)
+
+// ─── ALERTS ───────────────────────────────────────────────────────────
+alertcondition(maxEntry,
+     "Max Entry — 4+ Signals",
+     "4+ bottom signals — MAXIMUM accumulation zone!")
+
+alertcondition(heavyEntry,
+     "Heavy Entry — 3 Signals",
+     "3 bottom signals — heavy accumulation zone")
+
+alertcondition(dc_cross,
+     "Death Cross Confirmed",
+     "Death Cross: fast MA crossed below slow MA. Bear market structure.")
+
+alertcondition(reduceSignal,
+     "Reduce Position — 2 Exit Signals",
+     "2 exit signals active — consider reducing position size.")
+
+alertcondition(fullExitSignal,
+     "Full Exit — 3+ Exit Signals",
+     "3+ exit signals active — consider closing position.")
+
+alertcondition(exit_gc,
+     "Golden Cross Confirmed",
+     "Golden Cross: fast MA crossed above slow MA. Trend has reversed.")
+
+alertcondition(exit_rsiRoll,
+     "RSI Rollover — Momentum Exhaustion",
+     "RSI fell back below overbought level — momentum may be exhausting.")
+
+alertcondition(exit_200wExt,
+     "Price Extended Above 200W MA",
+     "Price has entered historically overextended territory above 200W MA.")
