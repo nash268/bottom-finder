@@ -1,35 +1,159 @@
 // ══════════════════════════════════════════════════════════════════════
-// Long-Term Bottom Finder — General Equities Edition v1.2
-// EXIT UPGRADE: scored tiered exits (max 4), new extension + rollover signals
+// Long-Term Bottom Finder — Equities Edition v2.2
+// CHANGES FROM v2.1 (fundamentals focused):
+//   • Fundamental Entry Quality Gate — Altman Z-Score, Piotroski F-Score,
+//     Debt/Equity, ROE, and Forward P/E percentile-vs-own-history, pulled
+//     via request.financial(). A technically oversold stock can still be
+//     a value trap; this cross-checks balance-sheet health, profitability,
+//     leverage and valuation before Max/Heavy Buy is allowed to fire.
+//     Runs alongside (ANDed with) the existing technical confirmation gate.
+//   • Fundamental Deterioration Gate (exit side) — weak Piotroski score,
+//     Altman Z sliding into the distress zone, rising Debt/Equity, and
+//     negative YoY EPS growth, gating the FULL EXIT tier the same way the
+//     technical exit confirmations already do.
+//   • Fundamentals section added to the dashboard table and on-chart label.
+// Fundamental data is equities-only: on indices, futures, forex, and
+// crypto, request.financial() returns na and those filters are ignored
+// automatically (ignore_invalid_symbol=true), so the script degrades
+// gracefully rather than erroring out.
+// CHANGES FROM v2.0 (exit-quality focused):
+//   • Persistence filter on RSI-OB / Price-Ratio-High / 200W-Extension
+//     (must hold N consecutive bars — kills single-bar-spike exits)
+//   • RSI bearish divergence detector (mirrors the entry-side bullish one)
+//   • Distribution volume climax (down-close volume spike)
+//   • Trend-deceleration filter (200W MA still rising but flattening)
+//   • Exit confirmation gate — mirrors the entry gate, but only gates the
+//     FULL EXIT tier (score >= 3). Reduce/Watch tiers stay ungated so
+//     early warnings are still responsive.
+//   • ATR chandelier trailing stop — independent, score-agnostic hard
+//     stop as a tail-risk backstop for when the composite score lags
+//     a fast decline.
+// NOTE: Still a lagging, rules-based composite indicator. None of this
+// "predicts" markets — it only structures historical state so you can
+// react with discipline. Backtest before trusting it with capital.
 // ══════════════════════════════════════════════════════════════════════
 //@version=6
-indicator("Long-Term Bottom Finder — Equities", overlay=true, max_bars_back=500)
+indicator("Long-Term Bottom Finder — Equities v2.2", overlay=true, max_bars_back=500)
 
 // ─── INPUTS ───────────────────────────────────────────────────────────
 grpRSI = "RSI Settings"
-rsiLen  = input.int(14, "RSI Length",               group=grpRSI)
-rsiOS   = input.int(30, "RSI Oversold Threshold",   group=grpRSI,
-          tooltip="Weekly RSI below this = oversold.")
-rsiOBin = input.int(70, "RSI Overbought Threshold", group=grpRSI,
-          tooltip="Weekly RSI above this = overbought.")
+rsiLen  = input.int(14, "RSI Length",                         group=grpRSI)
+rsiOS   = input.int(30, "RSI Oversold Threshold (fallback)",  group=grpRSI,
+          tooltip="Used only if Dynamic Thresholds are disabled.")
+rsiOBin = input.int(70, "RSI Overbought Threshold",           group=grpRSI)
 
-grpPR = "Price Ratio  (Price / 200-Day SMA Proxy)"
-prLowThresh  = input.float(0.75, "Price Ratio Low  (buy zone)",  step=0.05, group=grpPR,
-               tooltip="Below 0.75 = deeply below 200-day MA — strong buy zone.")
-prHighThresh = input.float(1.50, "Price Ratio High (exit zone)", step=0.05, group=grpPR,
-               tooltip="Above 1.50 = significantly extended above 200-day MA.")
+grpDyn = "Dynamic Thresholds (Percentile-Based)"
+useDynamic  = input.bool(true, "Use Percentile-Based Thresholds", group=grpDyn,
+              tooltip="Replaces fixed price-ratio/extension cutoffs with the instrument's OWN historical percentile rank — self-calibrates per ticker instead of one-size-fits-all.")
+pctLookback = input.int(252, "Percentile Lookback (bars)",     group=grpDyn)
+prLowPct    = input.int(10,  "Price Ratio Low Percentile (buy zone)",   group=grpDyn)
+prHighPct   = input.int(90,  "Price Ratio High Percentile (exit zone)", group=grpDyn)
+extPct200w  = input.int(90,  "200W Extension Percentile (exit zone)",   group=grpDyn)
+
+grpPR = "Price Ratio  (Fixed Fallback — used if Dynamic is OFF)"
+prLowThresh  = input.float(0.75, "Price Ratio Low  (buy zone)",  step=0.05, group=grpPR)
+prHighThresh = input.float(1.50, "Price Ratio High (exit zone)", step=0.05, group=grpPR)
+extendedPct  = input.float(40.0, "200W Extension Threshold (%)", step=5.0,  group=grpPR)
 
 grpDC = "Death / Golden Cross"
-dcMaFast = input.int(10, "Fast MA (weeks) — ~50-Day SMA",  group=grpDC,
-           tooltip="50-day SMA / 5 = 10 weeks.")
-dcMaSlow = input.int(40, "Slow MA (weeks) — ~200-Day SMA", group=grpDC,
-           tooltip="200-day SMA / 5 = 40 weeks.")
+dcMaFast    = input.int(10, "Fast MA (weeks) — ~50-Day SMA",  group=grpDC)
+dcMaSlow    = input.int(40, "Slow MA (weeks) — ~200-Day SMA", group=grpDC)
+confirmBars = input.int(3,  "Cross Confirmation Bars", group=grpDC,
+              tooltip="Fast MA must stay on one side of Slow MA for this many consecutive bars before a cross counts as valid. Reduces whipsaw around the MA cross.")
 
 grp200W = "200-Week MA Zone"
-nearPct     = input.float(5.0,  "Near 200W MA Entry Threshold (%)",     step=0.5,  group=grp200W,
-              tooltip="Price within this % above 200W MA = support zone.")
-extendedPct = input.float(40.0, "Extended Above 200W MA Exit Threshold (%)", step=5.0, group=grp200W,
-              tooltip="Price this % above 200W MA = historically overextended. Adds +1 to exit score.")
+nearPct = input.float(5.0, "Near 200W MA Entry Threshold (%)", step=0.5, group=grp200W)
+
+grpTrend = "Trend / Regime Filter (Entry Side)"
+useTrendFilter  = input.bool(true, "Enable Trend-Stabilizing Filter", group=grpTrend,
+                  tooltip="Checks whether the 200W MA's downward slope is flattening/turning up, rather than still accelerating lower. Helps avoid buying into a knife still falling.")
+slopeLen        = input.int(10, "200W MA Slope Lookback",        group=grpTrend)
+slopeCompareLen = input.int(5,  "Slope Improvement Compare Length", group=grpTrend)
+
+grpDiv = "RSI Divergence (Entry: Bullish, Exit: Bearish)"
+useDivergence = input.bool(true, "Enable RSI Bullish Divergence Detection (entries)", group=grpDiv)
+divLeft     = input.int(5,  "Pivot Left Bars",          group=grpDiv)
+divRight    = input.int(5,  "Pivot Right Bars",         group=grpDiv)
+divLookback = input.int(60, "Max Bars Between Pivots",  group=grpDiv)
+
+grpVol = "Volume Confirmation"
+useVolume = input.bool(true, "Enable Volume Climax Filter (entries)", group=grpVol,
+            tooltip="Capitulation bottoms typically show a volume spike. Requires volume above its moving average by a multiple.")
+volMaLen = input.int(50, "Volume MA Length",       group=grpVol)
+volMult  = input.float(1.5, "Volume Spike Multiple", step=0.1, group=grpVol)
+
+grpConfirm = "Entry Confirmation Gate"
+minConfirmations = input.int(1, "Min Confirmations Required for Max/Heavy Buy", minval=0, maxval=3, group=grpConfirm,
+                   tooltip="Number of enabled confirmation filters (trend stabilizing, RSI divergence, volume climax) that must be true before a Max/Heavy Buy signal is allowed to fire. Set to 0 to disable gating.")
+
+grpExitGate = "Exit Signal Quality (Persistence + Confirmation)"
+exitPersistBars      = input.int(2, "Bars Required to Confirm OB / Extension Signals", minval=1, group=grpExitGate,
+                        tooltip="An RSI-overbought, price-ratio-high, or 200W-extension reading must hold for this many consecutive bars before it counts toward the exit score. Filters single-bar spikes (e.g. an earnings gap) from triggering a premature exit tier.")
+useExitTrendFilter    = input.bool(true, "Require Trend Deceleration for Full Exit", group=grpExitGate,
+                        tooltip="200W MA still rising but its slope is flattening — momentum stalling near a top.")
+useExitDivergence     = input.bool(true, "Require Bearish RSI Divergence for Full Exit", group=grpExitGate,
+                        tooltip="Price makes a higher high while RSI makes a lower high — classic topping tell.")
+useExitVolume         = input.bool(true, "Require Distribution Volume for Full Exit", group=grpExitGate,
+                        tooltip="A volume spike on a down-close bar — heavier selling than normal.")
+minExitConfirmations  = input.int(1, "Min Confirmations Required for Full Exit", minval=0, maxval=3, group=grpExitGate,
+                        tooltip="Number of enabled exit-confirmation filters that must be true before a FULL EXIT (score >= 3) is allowed to fire. The Reduce (score==2) and Watch tiers are never gated, so early warnings stay responsive.")
+
+grpStop = "Structural Trailing Stop (Tail-Risk Safety Net)"
+useTrailingStop = input.bool(true, "Enable ATR Trailing Stop", group=grpStop,
+                  tooltip="Independent of the score system: ratchets a stop up from the highest close using ATR. A close below it is a hard risk-management exit even if the scored system hasn't caught up yet.")
+atrLen  = input.int(20, "ATR Length", group=grpStop)
+atrMult = input.float(4.0, "ATR Multiplier", step=0.25, group=grpStop)
+
+grpFund = "Fundamental Filters (Entry Quality / Value Check)"
+useFundamentals = input.bool(true, "Enable Fundamental Confirmation Gate", group=grpFund,
+                  tooltip="Adds a fundamentals-based quality/value check on top of the technical entry signals. A technically 'cheap' stock can still be a value trap — this cross-checks balance-sheet health, profitability, leverage and valuation before allowing a Max/Heavy Buy. Equities only: returns n/a (and is ignored) on indices, futures, forex and crypto.")
+fundPeriod      = input.string("FQ", "Reporting Period", options=["FQ", "FY"], group=grpFund,
+                  tooltip="FQ = most recent fiscal quarter, FY = most recent fiscal year.")
+fundPctLookback = input.int(252, "Valuation Percentile Lookback (bars)", group=grpFund,
+                  tooltip="Used to rank the current Forward P/E against the stock's OWN history, same self-calibrating approach as the Price Ratio filter above. Scale to your chart's timeframe (e.g. ~252 ≈ 5yr on weekly, ≈1yr on daily).")
+
+useAltman = input.bool(true, "Require Altman Z-Score Above Distress Zone", group=grpFund)
+altmanMin = input.float(1.81, "Altman Z-Score Minimum", step=0.1, group=grpFund,
+            tooltip="Below 1.81 = distress zone (elevated bankruptcy risk). 1.81-2.99 = grey zone. Above 2.99 = safe zone. Guards against buying a technical 'bottom' in a company that's actually heading toward insolvency.")
+
+usePiotroski = input.bool(true, "Require Piotroski F-Score Above Threshold", group=grpFund)
+piotroskiMin = input.int(5, "Piotroski F-Score Minimum (0-9)", minval=0, maxval=9, group=grpFund,
+               tooltip="Composite 9-point fundamental health score covering profitability, leverage and efficiency trends. Piotroski's original research used >=8 as 'strong' and <=2 as 'weak' — 5 is a reasonable 'not deteriorating' floor.")
+
+useDebtEquity = input.bool(true, "Require Debt/Equity Below Maximum", group=grpFund)
+maxDebtEquity = input.float(2.0, "Max Debt / Equity", step=0.1, group=grpFund,
+                tooltip="Filters out over-leveraged balance sheets, which are more likely to face refinancing or solvency stress during a downturn.")
+
+useROE = input.bool(true, "Require Return on Equity Positive", group=grpFund)
+minROE = input.float(0.0, "Minimum ROE (%)", step=1.0, group=grpFund,
+         tooltip="Basic profitability floor — the company should still be generating a positive return on shareholder capital.")
+
+usePEPercentile = input.bool(true, "Require Forward P/E Below Its Own Percentile", group=grpFund)
+peLowPct        = input.int(40, "Forward P/E Low Percentile (cheap zone)", minval=1, maxval=99, group=grpFund,
+                  tooltip="The stock's forward P/E must rank at or below this percentile of its own history — confirms the stock is fundamentally cheap relative to ITSELF, not just technically oversold.")
+
+minFundScore = input.int(2, "Min Fundamental Confirmations Required for Max/Heavy Buy", minval=0, maxval=5, group=grpFund,
+               tooltip="Number of the enabled fundamental filters above that must pass before a Max/Heavy Buy signal is allowed to fire. Set to 0 to disable gating while still displaying the data.")
+
+grpFundExit = "Fundamental Deterioration (Exit Confirmation)"
+useExitPiotroski = input.bool(true, "Flag Weak Piotroski F-Score", group=grpFundExit)
+piotroskiWeakMax = input.int(3, "Piotroski F-Score Weak Threshold (0-9)", minval=0, maxval=9, group=grpFundExit,
+                   tooltip="A score at or below this level signals deteriorating fundamental quality (Piotroski's own research treats <=2 as 'weak').")
+
+useExitAltman     = input.bool(true, "Flag Altman Z-Score Distress Zone", group=grpFundExit)
+altmanDistressMax = input.float(1.81, "Altman Z-Score Distress Threshold", step=0.1, group=grpFundExit)
+
+useExitDebtEquity = input.bool(true, "Flag Rising Debt/Equity", group=grpFundExit)
+deRiseLookback    = input.int(52, "D/E Comparison Lookback (bars)", group=grpFundExit,
+                    tooltip="Compares current Debt/Equity to its value this many bars ago. ~52 ≈ 1yr on a weekly chart; use ~252 for a daily chart. Catches balance-sheet deterioration a single-quarter snapshot would miss.")
+deRisePct         = input.float(20.0, "D/E Rise Threshold (%)", step=5.0, group=grpFundExit,
+                    tooltip="Debt/Equity must have increased by at least this percentage over the lookback window to count as 'rising'.")
+
+useExitEPSGrowth = input.bool(true, "Flag Negative EPS Growth", group=grpFundExit,
+                   tooltip="YoY basic EPS growth has turned negative — earnings are contracting, a common precursor to further downside even after a technical bottom.")
+
+minExitFundScore = input.int(1, "Min Deterioration Flags Required for Full Exit", minval=0, maxval=4, group=grpFundExit,
+                    tooltip="Number of the enabled deterioration flags above that must be true before a FULL EXIT is allowed to fire. Set to 0 to disable gating.")
 
 grpDisp = "Display"
 show200w     = input.bool(true, "Show 200-Week MA",            group=grpDisp)
@@ -44,85 +168,199 @@ sma_fast = ta.sma(close, dcMaFast)
 sma_slow = ta.sma(close, dcMaSlow)
 sma200w  = ta.sma(close, 200)
 
-// Extension level plotted as a dotted line so traders can see the target
-extLevel = not na(sma200w) ? sma200w * (1.0 + extendedPct / 100.0) : na
+priceRatio    = not na(sma_slow) ? close / sma_slow : na
+extLevelFixed = not na(sma200w)  ? sma200w * (1.0 + extendedPct / 100.0) : na
+pct200w       = not na(sma200w)  ? (close / sma200w - 1.0) * 100.0 : na
 
-// ─── CORE ENTRY SIGNALS ───────────────────────────────────────────────
+// ─── PERCENTILE RANKS (self-calibrating thresholds) ───────────────────
+prPercentile  = ta.percentrank(priceRatio, pctLookback)
+extPercentile = ta.percentrank(pct200w, pctLookback)
 
-// 1. Weekly RSI Oversold
-rsi       = ta.rsi(close, rsiLen)
-sig_rsiOS = rsi < rsiOS
+// ─── CONFIRMED MA CROSSOVERS (reduces whipsaw) ─────────────────────────
+fastAboveSlow = sma_fast > sma_slow
+var int barsAbove = 0
+var int barsBelow = 0
+barsAbove := fastAboveSlow ? barsAbove[1] + 1 : 0
+barsBelow := not fastAboveSlow ? barsBelow[1] + 1 : 0
+gc_confirmed = barsAbove == confirmBars
+dc_confirmed = barsBelow == confirmBars
 
-// 2. Death Cross Zone
-sig_dc   = sma_fast < sma_slow
-dc_cross = ta.crossunder(sma_fast, sma_slow)
-gc_cross = ta.crossover (sma_fast, sma_slow)
+// ─── TREND / REGIME (200W slope) ───────────────────────────────────────
+sma200w_slope    = sma200w - sma200w[slopeLen]
+trendStabilizing = useTrendFilter and sma200w_slope >= sma200w_slope[slopeCompareLen]
+topTrendWeakening = useExitTrendFilter and sma200w_slope > 0 and sma200w_slope < sma200w_slope[slopeCompareLen]
 
-// 3a. Near 200-Week MA
-sig_near200w  = close < (sma200w * (1.0 + nearPct / 100.0))
-// 3b. Below 200-Week MA — bonus
-sig_below200w = close < sma200w
+// ─── RSI ─────────────────────────────────────────────────────────────
+rsi = ta.rsi(close, rsiLen)
 
-// 4. Price Ratio
-priceRatio = not na(sma_slow) ? close / sma_slow : na
-sig_prLow  = not na(priceRatio) and priceRatio < prLowThresh
+// ─── RSI BULLISH DIVERGENCE (entry side — bottoming tell) ─────────────
+pl = ta.pivotlow(low, divLeft, divRight)
 
-// ─── ENTRY SCORE (max 5) ──────────────────────────────────────────────
+var float lastPivotLowPrice = na
+var float lastPivotLowRSI   = na
+var int   lastPivotLowBar   = na
+bullishDivEvent = false
+
+if not na(pl)
+    priceAtPivotL = low[divRight]
+    rsiValAtPivotL = rsi[divRight]
+    pivotBarIndexL = bar_index - divRight
+    if not na(lastPivotLowPrice) and (pivotBarIndexL - lastPivotLowBar) <= divLookback
+        if priceAtPivotL < lastPivotLowPrice and rsiValAtPivotL > lastPivotLowRSI
+            bullishDivEvent := true
+    lastPivotLowPrice := priceAtPivotL
+    lastPivotLowRSI   := rsiValAtPivotL
+    lastPivotLowBar   := pivotBarIndexL
+
+var int divHoldCounter = 0
+divHoldCounter := bullishDivEvent ? divRight + 2 : math.max(divHoldCounter - 1, 0)
+sig_bullDiv = useDivergence and divHoldCounter > 0
+
+// ─── RSI BEARISH DIVERGENCE (exit side — topping tell) ─────────────────
+ph = ta.pivothigh(high, divLeft, divRight)
+
+var float lastPivotHighPrice = na
+var float lastPivotHighRSI   = na
+var int   lastPivotHighBar   = na
+bearishDivEvent = false
+
+if not na(ph)
+    priceAtPivotH  = high[divRight]
+    rsiValAtPivotH = rsi[divRight]
+    pivotBarIndexH = bar_index - divRight
+    if not na(lastPivotHighPrice) and (pivotBarIndexH - lastPivotHighBar) <= divLookback
+        if priceAtPivotH > lastPivotHighPrice and rsiValAtPivotH < lastPivotHighRSI
+            bearishDivEvent := true
+    lastPivotHighPrice := priceAtPivotH
+    lastPivotHighRSI   := rsiValAtPivotH
+    lastPivotHighBar   := pivotBarIndexH
+
+var int divTopHoldCounter = 0
+divTopHoldCounter := bearishDivEvent ? divRight + 2 : math.max(divTopHoldCounter - 1, 0)
+sig_bearDiv = useExitDivergence and divTopHoldCounter > 0
+
+// ─── VOLUME CLIMAX (entry) / DISTRIBUTION (exit) ────────────────────────
+volMa = ta.sma(volume, volMaLen)
+sig_volClimax       = useVolume     and not na(volMa) and volume > volMa * volMult
+sig_volDistribution = useExitVolume and not na(volMa) and volume > volMa * volMult and close < open
+
+// ─── CORE ENTRY SIGNALS (max 5) ─────────────────────────────────────────
+sig_rsiOS     = rsi < rsiOS
+sig_dc        = sma_fast < sma_slow
+sig_near200w  = not na(sma200w) and close < (sma200w * (1.0 + nearPct / 100.0))
+sig_below200w = not na(sma200w) and close < sma200w
+sig_prLow_dyn = not na(prPercentile) and prPercentile <= prLowPct
+sig_prLow_fix = not na(priceRatio) and priceRatio < prLowThresh
+sig_prLow     = useDynamic ? sig_prLow_dyn : sig_prLow_fix
+
 sigScore = (
-    (sig_rsiOS     ? 1 : 0) +
-    (sig_dc        ? 1 : 0) +
-    (sig_near200w  ? 1 : 0) +
-    (sig_prLow     ? 1 : 0) +
-    (sig_below200w ? 1 : 0)
-)
+     (sig_rsiOS     ? 1 : 0) +
+     (sig_dc        ? 1 : 0) +
+     (sig_near200w  ? 1 : 0) +
+     (sig_prLow     ? 1 : 0) +
+     (sig_below200w ? 1 : 0))
 
 prevScore = na(sigScore[1]) ? 0 : sigScore[1]
 
-// ─── EXIT SIGNALS (scored, max 4) ────────────────────────────────────
-//
-//  +1  Golden Cross:           fast MA crossed back above slow MA
-//      (confirms trend reversal — bottom fully played out)
-//  +1  RSI Overbought:         RSI currently above threshold
-//      (momentum overheated)
-//  +1  RSI Rollover:           RSI was overbought, has now fallen back below
-//      (momentum exhaustion — often the last exit warning)
-//  +1  Price Ratio High:       price / 200-day SMA proxy above threshold
-//      (price stretched above medium-term average)
-//  +1  200W MA Extended:       price above 200W MA by extendedPct%
-//      (price stretched above long-term average — historically rare territory)
-//
-//  NOTE: RSI Overbought and RSI Rollover are mutually exclusive by design,
-//        so max realistic score remains 4.
+// ─── FUNDAMENTAL DATA REQUESTS (Equities Only — n/a on other asset classes) ──
+altmanZ    = useFundamentals ? request.financial(syminfo.tickerid, "ALTMAN_Z_SCORE", fundPeriod, ignore_invalid_symbol=true) : na
+piotroskiF = useFundamentals ? request.financial(syminfo.tickerid, "PIOTROSKI_F_SCORE", fundPeriod, ignore_invalid_symbol=true) : na
+debtEquity = useFundamentals ? request.financial(syminfo.tickerid, "DEBT_TO_EQUITY", fundPeriod, ignore_invalid_symbol=true) : na
+roe        = useFundamentals ? request.financial(syminfo.tickerid, "RETURN_ON_EQUITY", fundPeriod, ignore_invalid_symbol=true) : na
+peFwd      = useFundamentals ? request.financial(syminfo.tickerid, "PRICE_EARNINGS_FORWARD", fundPeriod, ignore_invalid_symbol=true) : na
+epsGrowth  = useFundamentals ? request.financial(syminfo.tickerid, "EARNINGS_PER_SHARE_BASIC_ONE_YEAR_GROWTH", fundPeriod, ignore_invalid_symbol=true) : na
 
-exit_gc        = gc_cross                                                    // event: crossover bar only
-exit_rsiOB     = rsi > rsiOBin                                               // state: currently overbought
-exit_rsiRoll   = rsi < rsiOBin and rsi[1] >= rsiOBin                        // event: just rolled below OB
-exit_prHigh    = not na(priceRatio) and priceRatio > prHighThresh            // state: price ratio extended
-exit_200wExt   = not na(sma200w)    and close > extLevel                    // state: far above 200W MA
+peFwdPercentile = ta.percentrank(peFwd, fundPctLookback)
 
-// RSI Overbought and Rollover are mutually exclusive — one or the other per bar
-exit_rsiAny    = exit_rsiOB or exit_rsiRoll
+// ─── FUNDAMENTAL ENTRY QUALITY SCORE (max 5, gates Max/Heavy Buy) ───────
+sig_altmanSafe  = useFundamentals and useAltman       and not na(altmanZ)         and altmanZ >= altmanMin
+sig_piotroskiOK = useFundamentals and usePiotroski    and not na(piotroskiF)      and piotroskiF >= piotroskiMin
+sig_deOK        = useFundamentals and useDebtEquity   and not na(debtEquity)      and debtEquity <= maxDebtEquity
+sig_roeOK       = useFundamentals and useROE          and not na(roe)             and roe >= minROE
+sig_peCheap     = useFundamentals and usePEPercentile and not na(peFwdPercentile) and peFwdPercentile <= peLowPct
 
-// ─── EXIT SCORE (max 4) ───────────────────────────────────────────────
+fundEnabledCount = (useAltman ? 1 : 0) + (usePiotroski ? 1 : 0) + (useDebtEquity ? 1 : 0) + (useROE ? 1 : 0) + (usePEPercentile ? 1 : 0)
+fundScore        = (sig_altmanSafe ? 1 : 0) + (sig_piotroskiOK ? 1 : 0) + (sig_deOK ? 1 : 0) + (sig_roeOK ? 1 : 0) + (sig_peCheap ? 1 : 0)
+fundGatePass     = (not useFundamentals) or fundEnabledCount == 0 or fundScore >= minFundScore
+
+// ─── ENTRY CONFIRMATION SCORE (max 3, gates Max/Heavy Buy) ─────────────
+confirmationScore = (
+     (trendStabilizing ? 1 : 0) +
+     (sig_bullDiv       ? 1 : 0) +
+     (sig_volClimax      ? 1 : 0))
+
+gatePass       = confirmationScore >= minConfirmations
+entryGatePass  = gatePass and fundGatePass   // technical confirmations AND fundamental quality
+
+// ─── EXIT SIGNALS — persistence-filtered (max 4) ────────────────────────
+exit_gc      = gc_confirmed
+exit_rsiOBraw = rsi > rsiOBin
+exit_rsiRoll  = rsi < rsiOBin and rsi[1] >= rsiOBin
+
+var int rsiOBBars = 0
+rsiOBBars := exit_rsiOBraw ? rsiOBBars[1] + 1 : 0
+exit_rsiOB_confirmed = rsiOBBars >= exitPersistBars
+exit_rsiAny = exit_rsiOB_confirmed or exit_rsiRoll
+
+prHighCondRaw = useDynamic ?
+     (not na(prPercentile) and prPercentile >= prHighPct) :
+     (not na(priceRatio) and priceRatio > prHighThresh)
+var int prHighBars = 0
+prHighBars := prHighCondRaw ? prHighBars[1] + 1 : 0
+exit_prHigh = prHighBars >= exitPersistBars
+
+extCondRaw = useDynamic ?
+     (not na(extPercentile) and extPercentile >= extPct200w) :
+     (not na(sma200w) and close > extLevelFixed)
+var int extBars = 0
+extBars := extCondRaw ? extBars[1] + 1 : 0
+exit_200wExt = extBars >= exitPersistBars
+
 exitScore = (
-    (exit_gc      ? 1 : 0) +
-    (exit_rsiAny  ? 1 : 0) +
-    (exit_prHigh  ? 1 : 0) +
-    (exit_200wExt ? 1 : 0)
-)
+     (exit_gc      ? 1 : 0) +
+     (exit_rsiAny  ? 1 : 0) +
+     (exit_prHigh  ? 1 : 0) +
+     (exit_200wExt ? 1 : 0))
 
 prevExitScore = na(exitScore[1]) ? 0 : exitScore[1]
 
-// Tiered exit thresholds
-// REDUCE:    exitScore reaches 2 for first time — trim position
-// FULL EXIT: exitScore reaches 3+ for first time — close or heavily reduce
-reduceSignal   = exitScore == 2 and prevExitScore < 2
-fullExitSignal = exitScore >= 3 and prevExitScore < 3
+prStr = not na(priceRatio) ? str.tostring(math.round(priceRatio, 3)) : "n/a"
 
-// Legacy combined boolean for alerts
-exitSignal = reduceSignal or fullExitSignal
+// ─── EXIT CONFIRMATION SCORE (max 3, gates FULL EXIT only) ─────────────
+exitConfirmationScore = (
+     (topTrendWeakening    ? 1 : 0) +
+     (sig_bearDiv          ? 1 : 0) +
+     (sig_volDistribution  ? 1 : 0))
 
-// ─── BACKGROUND ZONE COLOR (entry zones only) ────────────────────────
+exitGatePass = exitConfirmationScore >= minExitConfirmations
+
+// ─── FUNDAMENTAL DETERIORATION SCORE (max 4, gates Full Exit) ──────────
+sig_piotroskiWeak  = useFundamentals and useExitPiotroski  and not na(piotroskiF) and piotroskiF <= piotroskiWeakMax
+sig_altmanDistress = useFundamentals and useExitAltman     and not na(altmanZ)    and altmanZ < altmanDistressMax
+sig_deRising        = useFundamentals and useExitDebtEquity and not na(debtEquity) and not na(debtEquity[deRiseLookback]) and debtEquity > debtEquity[deRiseLookback] * (1.0 + deRisePct / 100.0)
+sig_epsGrowthNeg    = useFundamentals and useExitEPSGrowth  and not na(epsGrowth)  and epsGrowth < 0
+
+exitFundEnabledCount = (useExitPiotroski ? 1 : 0) + (useExitAltman ? 1 : 0) + (useExitDebtEquity ? 1 : 0) + (useExitEPSGrowth ? 1 : 0)
+exitFundScore         = (sig_piotroskiWeak ? 1 : 0) + (sig_altmanDistress ? 1 : 0) + (sig_deRising ? 1 : 0) + (sig_epsGrowthNeg ? 1 : 0)
+exitFundGatePass      = (not useFundamentals) or exitFundEnabledCount == 0 or exitFundScore >= minExitFundScore
+
+exitGateAllPass = exitGatePass and exitFundGatePass   // technical confirmations AND fundamental deterioration
+
+reduceSignalRaw = exitScore == 2 and prevExitScore < 2
+fullExitRaw     = exitScore >= 3 and prevExitScore < 3
+
+reduceSignal   = reduceSignalRaw                    // ungated: early warning stays responsive
+fullExitSignal = fullExitRaw and exitGateAllPass    // gated: strong sell call needs confirmation
+exitSignal     = reduceSignal or fullExitSignal
+
+// ─── ATR CHANDELIER TRAILING STOP (independent risk backstop) ──────────
+atrVal = ta.atr(atrLen)
+chStop = ta.highest(close, atrLen) - atrVal * atrMult
+var float trailStop = na
+trailStop := na(trailStop[1]) ? chStop : (close[1] > trailStop[1] ? math.max(chStop, trailStop[1]) : chStop)
+trailStopHit = useTrailingStop and ta.crossunder(close, trailStop)
+
+// ─── BACKGROUND ZONE COLOR ──────────────────────────────────────────────
 zoneColor = sigScore >= 5 ? color.new(color.purple,  45)
           : sigScore == 4 ? color.new(color.fuchsia,  55)
           : sigScore == 3 ? color.new(color.teal,     60)
@@ -132,19 +370,24 @@ zoneColor = sigScore >= 5 ? color.new(color.purple,  45)
 
 bgcolor(zoneColor, title="Accumulation Zone")
 
-// ─── MA PLOTS ─────────────────────────────────────────────────────────
+// ─── MA PLOTS ────────────────────────────────────────────────────────────
 plot(show200w     ? sma200w   : na, "200-Week MA",
      color=color.new(color.orange, 0), linewidth=2)
 plot(show200d     ? sma_slow  : na, "200-Day SMA Proxy (Slow MA)",
      color=color.new(color.blue, 20), linewidth=1)
 plot(showCrossMAs ? sma_fast  : na, "50-Day SMA Proxy (Fast MA)",
      color=color.new(color.lime, 10), linewidth=1)
-plot(showExtLine  ? extLevel  : na, "200W Extension Exit Level",
+plot(showExtLine and not useDynamic ? extLevelFixed : na, "200W Extension Exit Level",
      color=color.new(color.red, 40), linewidth=1, style=plot.style_circles)
+plot(useTrailingStop ? trailStop : na, "ATR Trailing Stop",
+     color=color.new(color.maroon, 0), linewidth=1, style=plot.style_linebr)
 
-// ─── ENTRY SHAPES ─────────────────────────────────────────────────────
-maxEntry   = sigScore >= 4 and prevScore < 4
-heavyEntry = sigScore == 3 and prevScore < 3
+// ─── ENTRY SHAPES (gated by confirmation filters) ──────────────────────
+maxEntryRaw   = sigScore >= 4 and prevScore < 4
+heavyEntryRaw = sigScore == 3 and prevScore < 3
+
+maxEntry   = maxEntryRaw   and entryGatePass
+heavyEntry = heavyEntryRaw and entryGatePass
 
 plotshape(maxEntry,
           title="Max Entry", text="MAX BUY",
@@ -156,39 +399,70 @@ plotshape(heavyEntry,
           style=shape.triangleup, location=location.belowbar,
           color=color.teal, textcolor=color.white, size=size.normal)
 
-plotshape(dc_cross and not maxEntry and not heavyEntry,
+plotshape(maxEntryRaw and not entryGatePass,
+          title="Entry Pending Confirmation", text="WAIT",
+          style=shape.triangleup, location=location.belowbar,
+          color=color.new(color.gray, 40), textcolor=color.white, size=size.small)
+
+plotshape(dc_confirmed and not maxEntry and not heavyEntry,
           title="Death Cross Event", text="DC",
           style=shape.circle, location=location.belowbar,
           color=color.red, textcolor=color.white, size=size.small)
 
-// ─── EXIT SHAPES (tiered) ─────────────────────────────────────────────
-// REDUCE — orange, small: 2 exit signals active
-// plotshape(reduceSignal,
-//           title="Reduce Position", text="REDUCE",
-//           style=shape.triangledown, location=location.abovebar,
-//           color=color.orange, textcolor=color.white, size=size.normal)
+plotshape(bullishDivEvent,
+          title="Bullish RSI Divergence", text="DIV",
+          style=shape.triangleup, location=location.belowbar,
+          color=color.new(color.aqua, 10), textcolor=color.black, size=size.small)
 
-// // FULL EXIT — red, large: 3+ exit signals active
-// plotshape(fullExitSignal,
-//           title="Full Exit", text="FULL EXIT",
-//           style=shape.triangledown, location=location.abovebar,
-//           color=color.red, textcolor=color.white, size=size.large)
+plotshape(sig_volClimax and (sig_rsiOS or sig_near200w),
+          title="Volume Climax", text="VOL",
+          style=shape.circle, location=location.belowbar,
+          color=color.new(color.yellow, 20), textcolor=color.black, size=size.tiny)
 
-// RSI Rollover standalone marker (even if exit score < 2) — subtle warning
+// ─── EXIT SHAPES (tiered) ────────────────────────────────────────────────
 plotshape(exit_rsiRoll and not reduceSignal and not fullExitSignal,
           title="RSI Rollover", text="RSI↓",
           style=shape.circle, location=location.abovebar,
           color=color.new(color.orange, 30), textcolor=color.white, size=size.small)
 
-// ─── DASHBOARD TABLE ──────────────────────────────────────────────────
+plotshape(fullExitRaw and not exitGateAllPass,
+          title="Full Exit Pending Confirmation", text="WAIT",
+          style=shape.triangledown, location=location.abovebar,
+          color=color.new(color.gray, 40), textcolor=color.white, size=size.small)
+
+plotshape(fullExitSignal,
+          title="Full Exit — Confirmed", text="EXIT",
+          style=shape.triangledown, location=location.abovebar,
+          color=color.red, textcolor=color.white, size=size.normal)
+
+plotshape(bearishDivEvent,
+          title="Bearish RSI Divergence", text="DIV",
+          style=shape.triangledown, location=location.abovebar,
+          color=color.new(color.fuchsia, 10), textcolor=color.black, size=size.small)
+
+plotshape(sig_volDistribution,
+          title="Distribution Volume", text="DIST",
+          style=shape.circle, location=location.abovebar,
+          color=color.new(color.maroon, 20), textcolor=color.white, size=size.tiny)
+
+plotshape(trailStopHit,
+          title="Trailing Stop Hit", text="STOP",
+          style=shape.xcross, location=location.abovebar,
+          color=color.new(color.maroon, 0), textcolor=color.white, size=size.small)
+
+// ─── DASHBOARD TABLE ──────────────────────────────────────────────────────
 var table dash = table.new(
-     position.top_right, 2, 14,
+     position.top_right, 2, 33,
      border_width=1, border_color=color.new(color.gray, 40),
      frame_color=color.new(color.gray, 40), frame_width=1)
 
 if showTable and barstate.islast
     c_hdr  = color.rgb(25, 25, 50)
     c_ehdr = color.rgb(50, 20, 20)
+    c_chdr = color.rgb(20, 45, 45)
+    c_xhdr = color.rgb(45, 20, 30)
+    c_vhdr = color.rgb(20, 45, 20)
+    c_dhdr = color.rgb(45, 35, 15)
     c_row  = color.rgb(15, 15, 35)
     c_ok   = color.lime
     c_no   = color.new(color.red, 20)
@@ -205,129 +479,187 @@ if showTable and barstate.islast
                    : exitScore == 1 ? color.new(color.yellow, 20)
                    : color.gray
 
-    // Pre-build all dynamic strings
     rsiLabel  = "RSI (" + str.tostring(rsiLen) + "W)"
     rsiVal    = (sig_rsiOS ? "✓ " : "✗ ") + str.tostring(math.round(rsi, 1))
-    dcGap     = not na(sma_fast) ? math.round((sma_slow / sma_fast - 1.0) * 100.0, 1) : 0.0
-    dcVal     = sig_dc ? "✓ ACTIVE" : "✗ Gap: " + str.tostring(dcGap) + "%"
-    pct200w   = not na(sma200w) ? math.round((close / sma200w - 1.0) * 100.0, 1) : 0.0
+    dcVal     = sig_dc ? "✓ ACTIVE" : "✗ inactive"
+    prLowVal  = (sig_prLow ? "✓ " : "✗ ") + prStr + (useDynamic and not na(prPercentile) ? " (pct " + str.tostring(math.round(prPercentile,0)) + ")" : "")
     nearLabel = "Near 200W MA (<" + str.tostring(nearPct) + "%)"
-    nearVal   = (sig_near200w ? "✓ " : "✗ ") + str.tostring(pct200w) + "%"
-    prVal     = not na(priceRatio) ? str.tostring(math.round(priceRatio, 3)) : "n/a"
-    prLowVal  = (sig_prLow ? "✓ " : "✗ ") + prVal
+    nearVal   = (sig_near200w ? "✓ " : "✗ ") + (not na(pct200w) ? str.tostring(math.round(pct200w, 1)) + "%" : "n/a")
 
-    // Exit signal strings
-    gcVal      = exit_gc     ? "✓ CROSSED"   : "✗ " + str.tostring(math.round((sma_fast / sma_slow - 1.0) * 100.0, 1)) + "% gap"
-    rsiOBVal   = exit_rsiOB  ? "✓ OB: "      + str.tostring(math.round(rsi, 1))
-               : exit_rsiRoll? "✓ ROLLOVER " + str.tostring(math.round(rsi, 1))
-               : "✗ " + str.tostring(math.round(rsi, 1))
-    prHiLabel  = "P.Ratio Hi (>" + str.tostring(prHighThresh) + ")"
-    prHiVal    = exit_prHigh ? "✓ " + prVal : "✗ " + prVal
-    extLabel   = "200W Extended (>" + str.tostring(extendedPct) + "%)"
-    extVal     = exit_200wExt ? "✓ " + str.tostring(pct200w) + "%" : "✗ " + str.tostring(pct200w) + "%"
+    gcVal     = exit_gc ? "✓ CONFIRMED" : "✗ no cross"
+    rsiOBVal  = exit_rsiOB_confirmed ? "✓ OB (" + str.tostring(rsiOBBars) + "b): " + str.tostring(math.round(rsi, 1))
+              : exit_rsiRoll ? "✓ ROLLOVER " + str.tostring(math.round(rsi, 1))
+              : "✗ " + str.tostring(math.round(rsi, 1))
+    prHiVal   = (exit_prHigh ? "✓ (" + str.tostring(prHighBars) + "b) " : "✗ ") + prStr
+    extVal    = (exit_200wExt ? "✓ (" + str.tostring(extBars) + "b) " : "✗ ") + (not na(pct200w) ? str.tostring(math.round(pct200w, 1)) + "%" : "n/a")
 
-    exitAction = exitScore >= 3 ? ">>> FULL EXIT <<<"
-               : exitScore == 2 ? ">> REDUCE <<"
+    exitAction = fullExitSignal ? ">>> FULL EXIT <<<"
+               : fullExitRaw and not exitGateAllPass ? "FULL EXIT (pending confirm)"
+               : reduceSignal ? ">> REDUCE <<"
                : exitScore == 1 ? "> WATCH >"
                : "No Exit Signal"
 
+    trendVal = not useTrendFilter ? "disabled" : (trendStabilizing ? "✓ stabilizing" : "✗ still falling")
+    divVal   = not useDivergence  ? "disabled" : (sig_bullDiv ? "✓ ACTIVE" : "✗ none")
+    volVal   = not useVolume      ? "disabled" : (sig_volClimax ? "✓ SPIKE" : "✗ normal")
+
+    topTrendVal = not useExitTrendFilter ? "disabled" : (topTrendWeakening ? "✓ weakening" : "✗ steady/falling")
+    bearDivVal  = not useExitDivergence  ? "disabled" : (sig_bearDiv ? "✓ ACTIVE" : "✗ none")
+    distVolVal  = not useExitVolume      ? "disabled" : (sig_volDistribution ? "✓ SPIKE" : "✗ normal")
+
+    stopVal = not useTrailingStop ? "disabled" : trailStopHit ? "✓ STOP HIT" : "active @ " + str.tostring(math.round(trailStop, 2))
+
+    altmanVal     = not useFundamentals or not useAltman     ? "disabled" : na(altmanZ)    ? "n/a" : (sig_altmanSafe  ? "✓ " : "✗ ") + str.tostring(math.round(altmanZ, 2))
+    piotroskiVal  = not useFundamentals or not usePiotroski  ? "disabled" : na(piotroskiF) ? "n/a" : (sig_piotroskiOK ? "✓ " : "✗ ") + str.tostring(math.round(piotroskiF, 0)) + " / 9"
+    deVal         = not useFundamentals or not useDebtEquity ? "disabled" : na(debtEquity) ? "n/a" : (sig_deOK        ? "✓ " : "✗ ") + str.tostring(math.round(debtEquity, 2))
+    roeVal        = not useFundamentals or not useROE        ? "disabled" : na(roe)        ? "n/a" : (sig_roeOK       ? "✓ " : "✗ ") + str.tostring(math.round(roe, 1)) + "%"
+    peVal         = not useFundamentals or not usePEPercentile ? "disabled" : na(peFwd) ? "n/a" :
+                     (sig_peCheap ? "✓ " : "✗ ") + str.tostring(math.round(peFwd, 1)) + (not na(peFwdPercentile) ? " (pct " + str.tostring(math.round(peFwdPercentile, 0)) + ")" : "")
+
+    piotroskiWeakVal  = not useFundamentals or not useExitPiotroski  ? "disabled" : na(piotroskiF) ? "n/a" : (sig_piotroskiWeak  ? "✓ WEAK " : "✗ ") + str.tostring(math.round(piotroskiF, 0)) + " / 9"
+    altmanDistressVal = not useFundamentals or not useExitAltman     ? "disabled" : na(altmanZ)    ? "n/a" : (sig_altmanDistress ? "✓ DISTRESS " : "✗ ") + str.tostring(math.round(altmanZ, 2))
+    deRisingVal       = not useFundamentals or not useExitDebtEquity ? "disabled" : na(debtEquity) ? "n/a" : (sig_deRising       ? "✓ RISING " : "✗ ") + str.tostring(math.round(debtEquity, 2))
+    epsGrowthVal      = not useFundamentals or not useExitEPSGrowth  ? "disabled" : na(epsGrowth)  ? "n/a" : (sig_epsGrowthNeg   ? "✓ NEGATIVE " : "✗ ") + str.tostring(math.round(epsGrowth, 1)) + "%"
+
     // ── ENTRY SECTION ──
-    table.cell(dash, 0, 0, "Bottom Finder — Equities",
-               text_color=c_wht, bgcolor=c_hdr,
-               text_size=size.small, text_halign=text.align_center)
+    table.cell(dash, 0, 0, "Bottom Finder v2.2 — Equities",
+               text_color=c_wht, bgcolor=c_hdr, text_size=size.small, text_halign=text.align_center)
     table.cell(dash, 1, 0, "ENTRY: " + str.tostring(sigScore) + " / 5",
-               text_color=c_wht, bgcolor=scoreColor,
-               text_size=size.small, text_halign=text.align_center)
+               text_color=c_wht, bgcolor=scoreColor, text_size=size.small, text_halign=text.align_center)
 
-    table.cell(dash, 0, 1, rsiLabel,
-               text_color=c_wht, bgcolor=c_row, text_size=size.small)
-    table.cell(dash, 1, 1, rsiVal,
-               text_color=sig_rsiOS ? c_ok : c_no, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 0, 1, rsiLabel, text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 1, rsiVal, text_color=sig_rsiOS ? c_ok : c_no, bgcolor=c_row, text_size=size.small)
 
-    table.cell(dash, 0, 2, "Death Cross Zone",
-               text_color=c_wht, bgcolor=c_row, text_size=size.small)
-    table.cell(dash, 1, 2, dcVal,
-               text_color=sig_dc ? c_ok : c_no, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 0, 2, "Death Cross Zone", text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 2, dcVal, text_color=sig_dc ? c_ok : c_no, bgcolor=c_row, text_size=size.small)
 
-    table.cell(dash, 0, 3, nearLabel,
-               text_color=c_wht, bgcolor=c_row, text_size=size.small)
-    table.cell(dash, 1, 3, nearVal,
-               text_color=sig_near200w ? c_ok : c_no, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 0, 3, nearLabel, text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 3, nearVal, text_color=sig_near200w ? c_ok : c_no, bgcolor=c_row, text_size=size.small)
 
-    table.cell(dash, 0, 4, "Below 200W MA (+1 bonus)",
-               text_color=c_wht, bgcolor=c_row, text_size=size.small)
-    table.cell(dash, 1, 4, sig_below200w ? "✓ YES" : "✗ NO",
-               text_color=sig_below200w ? c_ok : c_no, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 0, 4, "Below 200W MA (+1 bonus)", text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 4, sig_below200w ? "✓ YES" : "✗ NO", text_color=sig_below200w ? c_ok : c_no, bgcolor=c_row, text_size=size.small)
 
-    table.cell(dash, 0, 5, "Price Ratio (P / 200D SMA)",
-               text_color=c_wht, bgcolor=c_row, text_size=size.small)
-    table.cell(dash, 1, 5, prLowVal,
-               text_color=sig_prLow ? c_ok : c_no, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 0, 5, "Price Ratio (P / 200D SMA)", text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 5, prLowVal, text_color=sig_prLow ? c_ok : c_no, bgcolor=c_row, text_size=size.small)
+
+    // ── ENTRY CONFIRMATION SECTION ──
+    table.cell(dash, 0, 6, "── ENTRY CONFIRM ──", text_color=color.new(color.aqua,0), bgcolor=c_chdr, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 1, 6, str.tostring(confirmationScore) + " / 3  (need " + str.tostring(minConfirmations) + ")",
+               text_color=c_wht, bgcolor=gatePass ? color.new(color.teal,30) : color.new(color.gray,50), text_size=size.tiny, text_halign=text.align_center)
+
+    table.cell(dash, 0, 7, "Trend Stabilizing", text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 7, trendVal, text_color=trendStabilizing ? c_ok : c_no, bgcolor=c_row, text_size=size.small)
+
+    table.cell(dash, 0, 8, "RSI Bullish Divergence", text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 8, divVal, text_color=sig_bullDiv ? c_ok : c_no, bgcolor=c_row, text_size=size.small)
+
+    table.cell(dash, 0, 9, "Volume Climax", text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 9, volVal, text_color=sig_volClimax ? c_ok : c_no, bgcolor=c_row, text_size=size.small)
+
+    // ── FUNDAMENTALS SECTION ──
+    table.cell(dash, 0, 10, "── FUNDAMENTALS ──", text_color=color.new(color.lime,0), bgcolor=c_vhdr, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 1, 10, str.tostring(fundScore) + " / " + str.tostring(fundEnabledCount) + "  (need " + str.tostring(minFundScore) + ")",
+               text_color=c_wht, bgcolor=fundGatePass ? color.new(color.green,30) : color.new(color.gray,50), text_size=size.tiny, text_halign=text.align_center)
+
+    table.cell(dash, 0, 11, "Altman Z-Score", text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 11, altmanVal, text_color=sig_altmanSafe ? c_ok : c_no, bgcolor=c_row, text_size=size.small)
+
+    table.cell(dash, 0, 12, "Piotroski F-Score", text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 12, piotroskiVal, text_color=sig_piotroskiOK ? c_ok : c_no, bgcolor=c_row, text_size=size.small)
+
+    table.cell(dash, 0, 13, "Debt / Equity", text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 13, deVal, text_color=sig_deOK ? c_ok : c_no, bgcolor=c_row, text_size=size.small)
+
+    table.cell(dash, 0, 14, "Return on Equity", text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 14, roeVal, text_color=sig_roeOK ? c_ok : c_no, bgcolor=c_row, text_size=size.small)
+
+    table.cell(dash, 0, 15, "Forward P/E (percentile)", text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 15, peVal, text_color=sig_peCheap ? c_ok : c_no, bgcolor=c_row, text_size=size.small)
 
     // ── EXIT SECTION ──
-    table.cell(dash, 0, 6, "── EXIT SCORE ──",
-               text_color=color.new(color.red, 0), bgcolor=c_ehdr,
-               text_size=size.tiny, text_halign=text.align_center)
-    table.cell(dash, 1, 6, str.tostring(exitScore) + " / 4  " + exitAction,
-               text_color=c_wht, bgcolor=exitScoreColor,
-               text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 0, 16, "── EXIT SCORE ──", text_color=color.new(color.red,0), bgcolor=c_ehdr, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 1, 16, str.tostring(exitScore) + " / 4  " + exitAction,
+               text_color=c_wht, bgcolor=exitScoreColor, text_size=size.tiny, text_halign=text.align_center)
 
-    table.cell(dash, 0, 7, "Golden Cross",
-               text_color=c_wht, bgcolor=c_row, text_size=size.small)
-    table.cell(dash, 1, 7, gcVal,
-               text_color=exit_gc ? c_warn : c_no, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 0, 17, "Golden Cross (confirmed)", text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 17, gcVal, text_color=exit_gc ? c_warn : c_no, bgcolor=c_row, text_size=size.small)
 
-    table.cell(dash, 0, 8, "RSI OB / Rollover",
-               text_color=c_wht, bgcolor=c_row, text_size=size.small)
-    table.cell(dash, 1, 8, rsiOBVal,
-               text_color=exit_rsiAny ? c_warn : c_no, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 0, 18, "RSI OB / Rollover", text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 18, rsiOBVal, text_color=exit_rsiAny ? c_warn : c_no, bgcolor=c_row, text_size=size.small)
 
-    table.cell(dash, 0, 9, prHiLabel,
-               text_color=c_wht, bgcolor=c_row, text_size=size.small)
-    table.cell(dash, 1, 9, prHiVal,
-               text_color=exit_prHigh ? c_warn : c_no, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 0, 19, "P.Ratio High (persist)", text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 19, prHiVal, text_color=exit_prHigh ? c_warn : c_no, bgcolor=c_row, text_size=size.small)
 
-    table.cell(dash, 0, 10, extLabel,
-               text_color=c_wht, bgcolor=c_row, text_size=size.small)
-    table.cell(dash, 1, 10, extVal,
-               text_color=exit_200wExt ? color.red : c_no, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 0, 20, "200W Extended (persist)", text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 20, extVal, text_color=exit_200wExt ? color.red : c_no, bgcolor=c_row, text_size=size.small)
 
-    // ── ALERT STATUS ──
-    table.cell(dash, 0, 11, "── STATUS ──",
-               text_color=c_wht, bgcolor=c_hdr,
-               text_size=size.tiny, text_halign=text.align_center)
-    table.cell(dash, 1, 11, "",
-               bgcolor=c_hdr, text_color=c_wht, text_size=size.tiny)
+    // ── EXIT CONFIRMATION SECTION ──
+    table.cell(dash, 0, 21, "── EXIT CONFIRM ──", text_color=color.new(color.fuchsia,0), bgcolor=c_xhdr, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 1, 21, str.tostring(exitConfirmationScore) + " / 3  (need " + str.tostring(minExitConfirmations) + ")",
+               text_color=c_wht, bgcolor=exitGatePass ? color.new(color.red,30) : color.new(color.gray,50), text_size=size.tiny, text_halign=text.align_center)
 
-    table.cell(dash, 0, 12, "Entry Action",
-               text_color=c_wht, bgcolor=c_row, text_size=size.small)
-    table.cell(dash, 1, 12,
-               sigScore >= 4 ? "MAX BUY"   :
+    table.cell(dash, 0, 22, "Trend Weakening", text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 22, topTrendVal, text_color=topTrendWeakening ? c_warn : c_no, bgcolor=c_row, text_size=size.small)
+
+    table.cell(dash, 0, 23, "RSI Bearish Divergence", text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 23, bearDivVal, text_color=sig_bearDiv ? c_warn : c_no, bgcolor=c_row, text_size=size.small)
+
+    table.cell(dash, 0, 24, "Distribution Volume", text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 24, distVolVal, text_color=sig_volDistribution ? c_warn : c_no, bgcolor=c_row, text_size=size.small)
+
+    // ── FUNDAMENTAL DETERIORATION SECTION ──
+    table.cell(dash, 0, 25, "── FUND. DETERIORATION ──", text_color=color.new(color.orange,0), bgcolor=c_dhdr, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 1, 25, str.tostring(exitFundScore) + " / " + str.tostring(exitFundEnabledCount) + "  (need " + str.tostring(minExitFundScore) + ")",
+               text_color=c_wht, bgcolor=exitFundGatePass ? color.new(color.orange,30) : color.new(color.gray,50), text_size=size.tiny, text_halign=text.align_center)
+
+    table.cell(dash, 0, 26, "Piotroski Weak", text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 26, piotroskiWeakVal, text_color=sig_piotroskiWeak ? c_warn : c_no, bgcolor=c_row, text_size=size.small)
+
+    table.cell(dash, 0, 27, "Altman Z Distress", text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 27, altmanDistressVal, text_color=sig_altmanDistress ? c_warn : c_no, bgcolor=c_row, text_size=size.small)
+
+    table.cell(dash, 0, 28, "Debt/Equity Rising", text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 28, deRisingVal, text_color=sig_deRising ? c_warn : c_no, bgcolor=c_row, text_size=size.small)
+
+    table.cell(dash, 0, 29, "EPS Growth Negative", text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 29, epsGrowthVal, text_color=sig_epsGrowthNeg ? c_warn : c_no, bgcolor=c_row, text_size=size.small)
+
+    table.cell(dash, 0, 30, "ATR Trailing Stop", text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 30, stopVal, text_color=trailStopHit ? color.red : c_wht, bgcolor=c_row, text_size=size.small)
+
+    // ── STATUS ──
+    table.cell(dash, 0, 31, "Entry Action", text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 31,
+               maxEntryRaw and not entryGatePass ? "WAIT (needs confirm)" :
+               sigScore >= 4 ? "MAX BUY" :
                sigScore == 3 ? "HEAVY BUY" :
-               sigScore == 2 ? "WATCH"     : "NO SIGNAL",
-               text_color=sigScore >= 3 ? c_ok : sigScore == 2 ? c_warn : c_no,
+               sigScore == 2 ? "WATCH" : "NO SIGNAL",
+               text_color=(sigScore >= 3 and entryGatePass) ? c_ok : sigScore == 2 ? c_warn : c_no,
                bgcolor=c_row, text_size=size.small)
 
-    table.cell(dash, 0, 13, "Exit Action",
-               text_color=c_wht, bgcolor=c_row, text_size=size.small)
-    table.cell(dash, 1, 13, exitAction,
-               text_color=exitScore >= 3 ? color.red : exitScore >= 2 ? c_warn : c_no,
+    table.cell(dash, 0, 32, "Exit Action", text_color=c_wht, bgcolor=c_row, text_size=size.small)
+    table.cell(dash, 1, 32, exitAction,
+               text_color=fullExitSignal ? color.red : (reduceSignal or (fullExitRaw and not exitGateAllPass)) ? c_warn : c_no,
                bgcolor=c_row, text_size=size.small)
 
-// ─── ON-CHART LABEL ───────────────────────────────────────────────────
+// ─── ON-CHART LABEL ──────────────────────────────────────────────────────
 if showLabels and barstate.islast and (sigScore >= 2 or exitScore >= 2)
-    prStr    = not na(priceRatio) ? str.tostring(math.round(priceRatio, 2)) : "n/a"
-    labelTxt = "ENTRY " + str.tostring(sigScore) + "/5  |  EXIT " + str.tostring(exitScore) + "/4\n"
-             + (sig_rsiOS     ? "✓" : "✗") + " RSI: "          + str.tostring(math.round(rsi, 1)) + "\n"
+    labelTxt = "ENTRY " + str.tostring(sigScore) + "/5 (conf " + str.tostring(confirmationScore) + "/3, fund " + str.tostring(fundScore) + "/" + str.tostring(fundEnabledCount) + ")"
+             + "  |  EXIT " + str.tostring(exitScore) + "/4 (conf " + str.tostring(exitConfirmationScore) + "/3, fund " + str.tostring(exitFundScore) + "/" + str.tostring(exitFundEnabledCount) + ")\n"
+             + (sig_rsiOS     ? "✓" : "✗") + " RSI: " + str.tostring(math.round(rsi, 1)) + "\n"
              + (sig_dc        ? "✓" : "✗") + " Death Cross Zone\n"
              + (sig_near200w  ? "✓" : "✗") + " Near 200W MA\n"
              + (sig_below200w ? "✓" : "✗") + " Below 200W MA\n"
-             + (sig_prLow     ? "✓" : "✗") + " Price Ratio: "  + prStr
+             + (sig_prLow     ? "✓" : "✗") + " Price Ratio: " + prStr + "\n"
+             + (trendStabilizing ? "✓" : "✗") + " Trend Stabilizing  " + (sig_bullDiv ? "✓" : "✗") + " BullDiv  " + (sig_volClimax ? "✓" : "✗") + " VolClimax\n"
+             + (sig_altmanSafe ? "✓" : "✗") + " AltmanZ  " + (sig_piotroskiOK ? "✓" : "✗") + " Piotroski  " + (sig_deOK ? "✓" : "✗") + " D/E  " + (sig_roeOK ? "✓" : "✗") + " ROE  " + (sig_peCheap ? "✓" : "✗") + " FwdP/E\n"
+             + (topTrendWeakening ? "✓" : "✗") + " Trend Weakening  " + (sig_bearDiv ? "✓" : "✗") + " BearDiv  " + (sig_volDistribution ? "✓" : "✗") + " Distribution\n"
+             + (sig_piotroskiWeak ? "✓" : "✗") + " PiotroskiWeak  " + (sig_altmanDistress ? "✓" : "✗") + " AltmanDistress  " + (sig_deRising ? "✓" : "✗") + " D/E Rising  " + (sig_epsGrowthNeg ? "✓" : "✗") + " EPS Growth-"
 
-    labelColor = exitScore >= 3 ? color.red
-               : exitScore == 2 ? color.orange
-               : sigScore >= 4  ? color.purple
-               : sigScore == 3  ? color.teal
+    labelColor = fullExitSignal    ? color.red
+               : reduceSignal      ? color.orange
+               : maxEntry          ? color.purple
+               : heavyEntry        ? color.teal
                : color.blue
 
     label.new(bar_index, 0, labelTxt,
@@ -337,35 +669,25 @@ if showLabels and barstate.islast and (sigScore >= 2 or exitScore >= 2)
               textcolor=color.white,
               size=size.normal)
 
-// ─── ALERTS ───────────────────────────────────────────────────────────
-alertcondition(maxEntry,
-     "Max Entry — 4+ Signals",
-     "4+ bottom signals — MAXIMUM accumulation zone!")
+// ─── ALERTS ───────────────────────────────────────────────────────────────
+alertcondition(maxEntry,   "Max Entry — Confirmed",   "4+ bottom signals AND technical confirmation AND fundamental quality gate passed — MAXIMUM accumulation zone!")
+alertcondition(heavyEntry, "Heavy Entry — Confirmed", "3 bottom signals AND technical confirmation AND fundamental quality gate passed — heavy accumulation zone")
+alertcondition(maxEntryRaw and not entryGatePass, "Entry Pending Confirmation", "Entry score hit threshold but technical and/or fundamental confirmation filters not yet satisfied.")
+alertcondition(dc_confirmed, "Death Cross Confirmed", "Confirmed Death Cross: fast MA below slow MA for N bars. Bear structure.")
 
-alertcondition(heavyEntry,
-     "Heavy Entry — 3 Signals",
-     "3 bottom signals — heavy accumulation zone")
+alertcondition(reduceSignal,   "Reduce Position — 2 Exit Signals", "2 exit signals active (persistence-confirmed) — consider reducing position size.")
+alertcondition(fullExitSignal, "Full Exit — Confirmed", "3+ exit signals active AND technical confirmation AND fundamental deterioration gate passed — consider closing the position.")
+alertcondition(fullExitRaw and not exitGateAllPass, "Full Exit Pending Confirmation", "Exit score hit the full-exit threshold but technical (trend weakening / bearish divergence / distribution volume) and/or fundamental deterioration confirmation filters are not yet satisfied.")
+alertcondition(exit_gc,        "Golden Cross Confirmed",           "Confirmed Golden Cross — trend has reversed.")
+alertcondition(exit_rsiRoll,   "RSI Rollover",                     "RSI fell back below overbought — momentum may be exhausting.")
+alertcondition(exit_200wExt,   "Price Extended Above 200W MA (persistent)", "Price has held in historically overextended territory above the 200W MA for the required number of bars.")
+alertcondition(bullishDivEvent,"RSI Bullish Divergence",           "Price made a lower low while RSI made a higher low — potential reversal tell.")
+alertcondition(bearishDivEvent,"RSI Bearish Divergence",           "Price made a higher high while RSI made a lower high — potential topping tell.")
+alertcondition(sig_volClimax,        "Volume Climax",       "Volume spiked above its moving average by the configured multiple.")
+alertcondition(sig_volDistribution,  "Distribution Volume",  "Volume spiked on a down-close bar — heavier-than-normal selling.")
+alertcondition(trailStopHit,   "ATR Trailing Stop Hit", "Price closed below the ATR chandelier trailing stop — hard risk-management exit signal.")
 
-alertcondition(dc_cross,
-     "Death Cross Confirmed",
-     "Death Cross: fast MA crossed below slow MA. Bear market structure.")
-
-alertcondition(reduceSignal,
-     "Reduce Position — 2 Exit Signals",
-     "2 exit signals active — consider reducing position size.")
-
-alertcondition(fullExitSignal,
-     "Full Exit — 3+ Exit Signals",
-     "3+ exit signals active — consider closing position.")
-
-alertcondition(exit_gc,
-     "Golden Cross Confirmed",
-     "Golden Cross: fast MA crossed above slow MA. Trend has reversed.")
-
-alertcondition(exit_rsiRoll,
-     "RSI Rollover — Momentum Exhaustion",
-     "RSI fell back below overbought level — momentum may be exhausting.")
-
-alertcondition(exit_200wExt,
-     "Price Extended Above 200W MA",
-     "Price has entered historically overextended territory above 200W MA.")
+alertcondition(sig_altmanDistress, "Altman Z-Score Distress Zone", "Altman Z-Score has dropped into the distress zone — elevated bankruptcy risk.")
+alertcondition(sig_piotroskiWeak,  "Piotroski F-Score Weak",       "Piotroski F-Score has dropped to a weak level — deteriorating fundamental quality.")
+alertcondition(sig_deRising,       "Debt/Equity Rising",           "Debt/Equity has risen meaningfully over the comparison window — balance sheet leverage is deteriorating.")
+alertcondition(sig_epsGrowthNeg,   "EPS Growth Turned Negative",   "YoY basic EPS growth has turned negative — earnings are contracting.")
